@@ -2,9 +2,9 @@ use std::iter;
 use std::time::Instant;
 
 use chrono::Timelike;
-use egui::FontDefinitions;
+// use egui::FontDefinitions;
 use egui_wgpu_backend::{RenderPass, ScreenDescriptor};
-use egui_winit_platform::{Platform, PlatformDescriptor};
+use egui_winit::State as WinitState;
 use epi::*;
 use winit::event::Event::*;
 use winit::event_loop::ControlFlow;
@@ -20,7 +20,7 @@ enum Event {
 /// It sends the custom RequestRedraw event to the winit event loop.
 struct ExampleRepaintSignal(std::sync::Mutex<winit::event_loop::EventLoopProxy<Event>>);
 
-impl epi::RepaintSignal for ExampleRepaintSignal {
+impl epi::backend::RepaintSignal for ExampleRepaintSignal {
     fn request_repaint(&self) {
         self.0.lock().unwrap().send_event(Event::RequestRedraw).ok();
     }
@@ -78,13 +78,8 @@ fn main() {
     )));
 
     // We use the egui_winit_platform crate as the platform.
-    let mut platform = Platform::new(PlatformDescriptor {
-        physical_width: size.width as u32,
-        physical_height: size.height as u32,
-        scale_factor: window.scale_factor(),
-        font_definitions: FontDefinitions::default(),
-        style: Default::default(),
-    });
+    let mut context = egui::CtxRef::default();
+    let mut platform = WinitState::new(&window);
 
     // We use the egui_wgpu_backend crate as the render backend.
     let mut egui_rpass = RenderPass::new(&device, surface_format, 1);
@@ -92,16 +87,27 @@ fn main() {
     // Display the demo application that ships with egui.
     let mut demo_app = egui_demo_lib::WrapApp::default();
 
-    let start_time = Instant::now();
-    let mut previous_frame_time = None;
-    event_loop.run(move |event, _, control_flow| {
-        // Pass the winit events to the platform integration.
-        platform.handle_event(&event);
+    // let start_time = Instant::now();
 
+    let frame = epi::Frame(std::sync::Arc::new(std::sync::Mutex::new(
+        epi::backend::FrameData {
+            info: epi::IntegrationInfo {
+                name: "egui_example",
+                web_info: None,
+                cpu_usage: None,
+                native_pixels_per_point: Some(window.scale_factor() as _),
+                prefer_dark_mode: None,
+            },
+            output: epi::backend::AppOutput::default(),
+            repaint_signal: repaint_signal.clone(),
+        },
+    )));
+
+    demo_app.setup(&context, &frame, None);
+
+    event_loop.run(move |event, _, control_flow| {
         match event {
             RedrawRequested(..) => {
-                platform.update_time(start_time.elapsed().as_secs_f64());
-
                 let output_frame = match surface.get_current_texture() {
                     Ok(frame) => frame,
                     Err(wgpu::SurfaceError::Outdated) => {
@@ -121,36 +127,33 @@ fn main() {
 
                 // Begin to draw the UI frame.
                 let egui_start = Instant::now();
-                platform.begin_frame();
-                let mut app_output = epi::backend::AppOutput::default();
+                let raw_input = platform.take_egui_input(&window);
+                let (output, shapes) = context.run(raw_input, |ctx| {
+                    // Draw the demo application.
+                    demo_app.update(ctx, &frame);
+                });
 
-                let mut frame = epi::backend::FrameBuilder {
-                    info: epi::IntegrationInfo {
-                        name: "egui_example",
-                        web_info: None,
-                        cpu_usage: previous_frame_time,
-                        native_pixels_per_point: Some(window.scale_factor() as _),
-                        prefer_dark_mode: None,
-                    },
-                    tex_allocator: &mut egui_rpass,
-                    output: &mut app_output,
-                    repaint_signal: repaint_signal.clone(),
-                }
-                .build();
+                platform.handle_output(&window, &context, output);
 
-                // Draw the demo application.
-                demo_app.update(&platform.context(), &mut frame);
-
-                // End the UI frame. We could now handle the output and draw the UI with the backend.
-                let (_output, paint_commands) = platform.end_frame(Some(&window));
-                let paint_jobs = platform.context().tessellate(paint_commands);
+                let paint_jobs = context.tessellate(shapes);
 
                 let frame_time = (Instant::now() - egui_start).as_secs_f64() as f32;
-                previous_frame_time = Some(frame_time);
+                frame.lock().info.cpu_usage = Some(frame_time);
 
                 let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("encoder"),
                 });
+
+                // TODO Make RenderPass do this.
+                let tex_data = frame.0.lock().unwrap().output.tex_allocation_data.take();
+
+                for (index, data) in tex_data.creations {
+                    egui_rpass.set_texture(index, data);
+                }
+
+                for index in tex_data.destructions {
+                    egui_rpass.free_texture(index);
+                }
 
                 // Upload all resources for the GPU.
                 let screen_descriptor = ScreenDescriptor {
@@ -158,7 +161,7 @@ fn main() {
                     physical_height: surface_config.height,
                     scale_factor: window.scale_factor() as f32,
                 };
-                egui_rpass.update_texture(&device, &queue, &platform.context().texture());
+                egui_rpass.update_texture(&device, &queue, &context.font_image());
                 egui_rpass.update_user_textures(&device, &queue);
                 egui_rpass.update_buffers(&device, &queue, &paint_jobs, &screen_descriptor);
 
@@ -188,22 +191,26 @@ fn main() {
             MainEventsCleared | UserEvent(Event::RequestRedraw) => {
                 window.request_redraw();
             }
-            WindowEvent { event, .. } => match event {
-                winit::event::WindowEvent::Resized(size) => {
-                    // Resize with 0 width and height is used by winit to signal a minimize event on Windows.
-                    // See: https://github.com/rust-windowing/winit/issues/208
-                    // This solves an issue where the app would panic when minimizing on Windows.
-                    if size.width > 0 && size.height > 0 {
-                        surface_config.width = size.width;
-                        surface_config.height = size.height;
-                        surface.configure(&device, &surface_config);
+            WindowEvent { event, .. } => {
+                if !platform.on_event(&context, &event) {
+                    match event {
+                        winit::event::WindowEvent::Resized(size) => {
+                            // Resize with 0 width and height is used by winit to signal a minimize event on Windows.
+                            // See: https://github.com/rust-windowing/winit/issues/208
+                            // This solves an issue where the app would panic when minimizing on Windows.
+                            if size.width > 0 && size.height > 0 {
+                                surface_config.width = size.width;
+                                surface_config.height = size.height;
+                                surface.configure(&device, &surface_config);
+                            }
+                        }
+                        winit::event::WindowEvent::CloseRequested => {
+                            *control_flow = ControlFlow::Exit;
+                        }
+                        _ => {}
                     }
                 }
-                winit::event::WindowEvent::CloseRequested => {
-                    *control_flow = ControlFlow::Exit;
-                }
-                _ => {}
-            },
+            }
             _ => (),
         }
     });
