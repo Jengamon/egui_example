@@ -145,15 +145,7 @@ fn main() {
                 });
 
                 // TODO Make RenderPass do this.
-                let tex_data = frame.0.lock().unwrap().output.tex_allocation_data.take();
-
-                for (index, data) in tex_data.creations {
-                    egui_rpass.set_texture(index, data);
-                }
-
-                for index in tex_data.destructions {
-                    egui_rpass.free_texture(index);
-                }
+                egui_rpass.extract_frame_data(&frame);
 
                 // Upload all resources for the GPU.
                 let screen_descriptor = ScreenDescriptor {
